@@ -77,7 +77,8 @@ type Runtime struct {
 	content      func(*Runtime, Expression)
 	includeDepth int
 
-	context reflect.Value
+	context      reflect.Value
+	currentBlock *BlockNode // block whose body is currently being executed (for {{yield super()}})
 }
 
 // Context returns the current context value
@@ -233,6 +234,7 @@ func (st *Runtime) recover(err *error) {
 	// reset state scope and context just to be safe (they might not be cleared properly if there was a panic while using the state)
 	st.scope = &scope{}
 	st.context = reflect.Value{}
+	st.currentBlock = nil
 	pool_State.Put(st)
 	if recovered := recover(); recovered != nil {
 		var ok bool
@@ -338,6 +340,10 @@ func (st *Runtime) executeLetList(set *SetNode) {
 
 func (st *Runtime) executeYieldBlock(block *BlockNode, blockParam, yieldParam *BlockParameterList, expression Expression, content *ListNode) {
 
+	previousBlock := st.currentBlock
+	st.currentBlock = block
+	defer func() { st.currentBlock = previousBlock }()
+
 	needNewScope := len(blockParam.List) > 0 || len(yieldParam.List) > 0
 	if needNewScope {
 		st.newScope()
@@ -398,6 +404,123 @@ func (st *Runtime) executeYieldBlock(block *BlockNode, blockParam, yieldParam *B
 	st.content = mycontent
 	if needNewScope {
 		st.releaseScope()
+	}
+}
+
+// lookupVariable resolves a variable from the current scope chain only
+// (no globals or default variables).
+func (st *Runtime) lookupVariable(name string) (reflect.Value, bool) {
+	sc := st.scope
+	for sc != nil {
+		if v, ok := sc.variables[name]; ok {
+			return v, true
+		}
+		sc = sc.parent
+	}
+	return reflect.Value{}, false
+}
+
+// executeSuperYield executes a {{yield super(...)}} statement: it renders the
+// definition that the currently executing block definition overrides.
+func (st *Runtime) executeSuperYield(node *YieldNode) {
+	current := st.currentBlock
+	if current == nil || current.Super == nil {
+		node.errorf("no super definition: the current block does not override another definition of the same name")
+	}
+	super := current.Super
+	st.executeSuperYieldBlock(super, super.Parameters, node.Parameters, node.Expression, node.Content)
+}
+
+// executeSuperYieldBlock is the super-yield counterpart of executeYieldBlock.
+// Block parameters not explicitly passed at the yield site are inherited from
+// the currently bound arguments of the enclosing (overriding) block call
+// before falling back to the super definition's own default values.
+// Unlike executeYieldBlock it restores the scope and content via defer, so
+// they are also restored when the block body is left through a {{return}} or
+// a panic caught by {{try}}.
+func (st *Runtime) executeSuperYieldBlock(block *BlockNode, blockParam, yieldParam *BlockParameterList, expression Expression, content *ListNode) {
+
+	previousBlock := st.currentBlock
+	st.currentBlock = block
+	defer func() { st.currentBlock = previousBlock }()
+
+	needNewScope := len(blockParam.List) > 0 || len(yieldParam.List) > 0
+
+	// capture inherited parameter values before pushing the new scope
+	var inherited map[string]reflect.Value
+	if needNewScope && len(blockParam.List) > 0 {
+		for i := 0; i < len(blockParam.List); i++ {
+			p := &blockParam.List[i]
+			if _, idx := yieldParam.Param(p.Identifier); idx >= 0 {
+				continue // explicitly passed at the yield site
+			}
+			if v, ok := st.lookupVariable(p.Identifier); ok {
+				if inherited == nil {
+					inherited = make(map[string]reflect.Value)
+				}
+				inherited[p.Identifier] = v
+			}
+		}
+	}
+
+	if needNewScope {
+		st.newScope()
+		defer st.releaseScope()
+		for i := 0; i < len(yieldParam.List); i++ {
+			p := &yieldParam.List[i]
+
+			if p.Expression == nil {
+				block.errorf("missing name for block parameter '%s'", blockParam.List[i].Identifier)
+			}
+
+			st.variables[p.Identifier] = st.evalPrimaryExpressionGroup(p.Expression)
+		}
+		for i := 0; i < len(blockParam.List); i++ {
+			p := &blockParam.List[i]
+			if _, found := st.variables[p.Identifier]; !found {
+				if v, ok := inherited[p.Identifier]; ok {
+					st.variables[p.Identifier] = v
+				} else if p.Expression == nil {
+					st.variables[p.Identifier] = valueBoolFALSE
+				} else {
+					st.variables[p.Identifier] = st.evalPrimaryExpressionGroup(p.Expression)
+				}
+			}
+		}
+	}
+
+	mycontent := st.content
+	defer func() { st.content = mycontent }()
+	if content != nil {
+		myscope := st.scope
+		st.content = func(st *Runtime, expression Expression) {
+			outscope := st.scope
+			outcontent := st.content
+
+			st.scope = myscope
+			st.content = mycontent
+
+			if expression != nil {
+				context := st.context
+				st.context = st.evalPrimaryExpressionGroup(expression)
+				st.executeList(content)
+				st.context = context
+			} else {
+				st.executeList(content)
+			}
+
+			st.scope = outscope
+			st.content = outcontent
+		}
+	}
+
+	if expression != nil {
+		context := st.context
+		defer func() { st.context = context }()
+		st.context = st.evalPrimaryExpressionGroup(expression)
+		st.executeList(block.List)
+	} else {
+		st.executeList(block.List)
 	}
 }
 
@@ -542,6 +665,8 @@ func (st *Runtime) executeList(list *ListNode) (returnValue reflect.Value) {
 				if st.content != nil {
 					st.content(st, node.Expression)
 				}
+			} else if node.IsSuper {
+				st.executeSuperYield(node)
 			} else {
 				block, found := st.getBlock(node.Name)
 				if !found || block == nil {

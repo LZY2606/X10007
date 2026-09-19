@@ -25,6 +25,16 @@ type Set struct {
 	rightDelim      string
 	leftComment       string
 	rightComment     string
+
+	// rmx guards generation and reloaded, which together implement cache
+	// invalidation for Reload without changing the Cache interface:
+	// generation is bumped on every Reload, and reloaded records for each
+	// canonical template path the generation at which it was invalidated.
+	// A cached template is stale when one of its transitive dependencies
+	// (Template.deps) was invalidated after the template was parsed.
+	rmx        sync.RWMutex
+	generation uint64
+	reloaded   map[string]uint64
 }
 
 // Option is the type of option functions that can be used in NewSet().
@@ -48,6 +58,7 @@ func NewSet(loader Loader, opts ...Option) *Set {
 			".html.jet",
 			".jet.html",
 		},
+		reloaded: make(map[string]uint64),
 	}
 
 	for _, opt := range opts {
@@ -166,6 +177,12 @@ func (s *Set) getTemplateFromCache(templatePath string) (t *Template, ok bool) {
 	for _, extension := range s.extensions {
 		canonicalPath := templatePath + extension
 		if t := s.cache.Get(canonicalPath); t != nil {
+			if s.isStale(t) {
+				// the cached template (or one of its transitive
+				// dependencies) was invalidated by Reload: fall
+				// through to the loader and re-parse
+				return nil, false
+			}
 			return t, true
 		}
 	}
@@ -209,6 +226,65 @@ func (s *Set) Parse(templatePath, contents string) (template *Template, err erro
 	templatePath = path.Join("/", templatePath)
 
 	return s.parse(templatePath, contents, false)
+}
+
+// Reload invalidates the cached parse result for templatePath and for every
+// cached template that transitively depends on it via extends or import.
+// The next GetTemplate() call for any of those templates will fetch the
+// contents from the Loader again and re-parse them. Templates that do not
+// transitively depend on templatePath are not affected and will keep being
+// served from the cache without hitting the Loader.
+//
+// Reload does not mutate the Cache (the Cache interface has no deletion
+// method, so custom Cache implementations keep working unchanged). Instead,
+// the Set records the invalidation and treats matching cache entries as
+// stale from that point on.
+//
+// It returns an error if the template cannot be found via the Set's Loader.
+func (s *Set) Reload(templatePath string) error {
+	templatePath = filepath.ToSlash(templatePath)
+	if !path.IsAbs(templatePath) {
+		templatePath = path.Join("/", templatePath)
+	}
+
+	found := false
+	for _, extension := range s.extensions {
+		if s.loader.Exists(templatePath + extension) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("template %s could not be found", templatePath)
+	}
+
+	s.rmx.Lock()
+	defer s.rmx.Unlock()
+	s.generation++
+	for _, extension := range s.extensions {
+		s.reloaded[templatePath+extension] = s.generation
+	}
+	return nil
+}
+
+// reloadGeneration returns the Set's current reload generation.
+func (s *Set) reloadGeneration() uint64 {
+	s.rmx.RLock()
+	defer s.rmx.RUnlock()
+	return s.generation
+}
+
+// isStale reports whether the cached template was parsed before one of its
+// transitive dependencies (or the template itself) was invalidated by Reload.
+func (s *Set) isStale(t *Template) bool {
+	s.rmx.RLock()
+	defer s.rmx.RUnlock()
+	for _, dep := range t.deps {
+		if s.reloaded[dep] > t.generation {
+			return true
+		}
+	}
+	return false
 }
 
 // AddGlobal adds a global variable into the Set,

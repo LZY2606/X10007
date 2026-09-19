@@ -98,6 +98,7 @@ const (
 	itemTry
 	itemCatch
 	itemReturn
+	itemSuper
 	itemAnd
 	itemOr
 	itemNot
@@ -125,6 +126,8 @@ var key = map[string]itemType{
 	"catch": itemCatch,
 
 	"return": itemReturn,
+
+	"super": itemSuper,
 
 	"and": itemAnd,
 	"or":  itemOr,

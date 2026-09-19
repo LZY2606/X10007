@@ -502,6 +502,12 @@ type BlockNode struct {
 
 	List    *ListNode
 	Content *ListNode
+
+	// Super is the previous definition of the block with the same name that
+	// this definition overrides (via extends/import merge order). It is nil
+	// when no definition was overridden. It is set during parsing and never
+	// changes afterwards.
+	Super *BlockNode
 }
 
 func (t *BlockNode) String() string {
@@ -525,6 +531,7 @@ type YieldNode struct {
 	Expression Expression //The command to evaluate as dot for the template.
 	Content    *ListNode
 	IsContent  bool
+	IsSuper    bool // true for {{yield super(...)}}
 }
 
 func (t *YieldNode) String() string {
@@ -533,6 +540,19 @@ func (t *YieldNode) String() string {
 			return "{{yield content}}"
 		}
 		return fmt.Sprintf("{{yield content %s}}", t.Expression)
+	}
+
+	if t.IsSuper {
+		if t.Content != nil {
+			if t.Expression == nil {
+				return fmt.Sprintf("{{yield super(%s) content}}%s{{end}}", t.Parameters, t.Content)
+			}
+			return fmt.Sprintf("{{yield super(%s) %s content}}%s{{end}}", t.Parameters, t.Expression, t.Content)
+		}
+		if t.Expression == nil {
+			return fmt.Sprintf("{{yield super(%s)}}", t.Parameters)
+		}
+		return fmt.Sprintf("{{yield super(%s) %s}}", t.Parameters, t.Expression)
 	}
 
 	if t.Content != nil {

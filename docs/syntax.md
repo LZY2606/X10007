@@ -49,6 +49,7 @@
   - [Recursion](#recursion)
   - [extends](#extends)
   - [import](#import)
+  - [super](#super)
 
 ## Delimiters
 
@@ -695,3 +696,40 @@ Executing `index.jet` will produce:
 `import` makes all the blocks from the imported template available in the importing template. There is no way to only import (a) specific block(s).
 
 Since the imported template isn't actually executed, the blocks defined in it don't run until you `yield` them explicitely.
+
+### super
+
+When a block definition overrides another definition of the same name (via `extends` or `import`), the overridden definition is not lost: it can be invoked from inside the overriding block's body with `{{ yield super() }}`. This makes it easy to wrap a parent template's block instead of copying it:
+
+    <!-- file: "layout.jet" -->
+    {{ block body() }}
+    <main>Default body</main>
+    {{ end }}
+
+    <!-- file: "page.jet" -->
+    {{ extends "./layout.jet" }}
+    {{ block body() }}
+    <div class="wrapper">
+        {{ yield super() }}
+    </div>
+    {{ end }}
+
+Executing `page.jet` renders the `body` block of `page.jet`, and the `{{ yield super() }}` inside it renders the overridden `body` block from `layout.jet`.
+
+The super chain can be longer than two levels: if `page.jet` extends `section.jet` which extends `base.jet`, and all three define `body()`, then `{{ yield super() }}` in `page.jet`'s definition renders `section.jet`'s definition, and `{{ yield super() }}` inside `section.jet`'s definition renders `base.jet`'s definition. Blocks coming from `import` participate in the same chain, following the order in which blocks are merged (extended template first, then imports, then the template's own definitions).
+
+`yield super()` accepts a parameter list just like a regular `yield`:
+
+    {{ yield super(md=6) }}
+
+Parameters that are not passed explicitly are inherited from the arguments currently bound in the enclosing (overriding) block call; parameters that are neither passed nor inherited fall back to the default values declared on the overridden definition.
+
+Content can be passed as well:
+
+    {{ yield super() content }}
+        extra content
+    {{ end }}
+
+A `{{ yield content }}` inside the overridden definition renders the content stored at the outermost call site, unless a closer `yield` in between passed its own content.
+
+Using `{{ yield super() }}` in a block that does not override another definition of the same name is a runtime error.

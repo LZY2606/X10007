@@ -39,6 +39,13 @@ type Template struct {
 	passedBlocks    map[string]*BlockNode
 	Root            *ListNode // top-level root of the tree.
 
+	// deps holds the canonical paths of every template this template
+	// transitively depends on via extends/import (including itself).
+	// generation is the Set's reload generation at parse time. Both are
+	// used by Set.Reload to decide whether a cached template is stale.
+	deps       []string
+	generation uint64
+
 	text string // text parsed to create the template (or its parent)
 
 	// Parsing only; cleared after parse.
@@ -82,6 +89,16 @@ func (t *Template) addBlocks(blocks map[string]*BlockNode) {
 		t.processedBlocks = make(map[string]*BlockNode)
 	}
 	for key, value := range blocks {
+		if existing, ok := t.processedBlocks[key]; ok && existing != value {
+			// value overrides the previous definition of the block: link the
+			// overridden definition as the super of the overriding one.
+			// The overriding block may be shared with other templates (e.g.
+			// coming from an imported template's processedBlocks), so instead
+			// of mutating it, a shallow copy carrying the super link is stored.
+			overriding := *value
+			overriding.Super = existing
+			value = &overriding
+		}
 		t.processedBlocks[key] = value
 	}
 }
@@ -230,6 +247,25 @@ func (s *Set) parse(name, text string, cacheAfterParsing bool) (t *Template, err
 	}
 
 	t.addBlocks(t.passedBlocks)
+
+	// record the transitive dependency closure (via extends/import) so
+	// Set.Reload can invalidate this template when any dependency changes
+	t.generation = s.reloadGeneration()
+	depSet := map[string]struct{}{t.Name: {}}
+	if t.extends != nil {
+		for _, dep := range t.extends.deps {
+			depSet[dep] = struct{}{}
+		}
+	}
+	for _, _import := range t.imports {
+		for _, dep := range _import.deps {
+			depSet[dep] = struct{}{}
+		}
+	}
+	t.deps = make([]string, 0, len(depSet))
+	for dep := range depSet {
+		t.deps = append(t.deps, dep)
+	}
 
 	return t, err
 }
@@ -416,6 +452,7 @@ func (t *Template) parseYield() Node {
 		name    item
 		bplist  *BlockParameterList
 		content *ListNode
+		isSuper bool
 	)
 
 	// parse block name
@@ -427,6 +464,9 @@ func (t *Template) parseYield() Node {
 		}
 		t.expectRightDelim(context)
 		return t.newYield(name.pos, t.lex.lineNumber(), "", nil, pipe, nil, true)
+	} else if name.typ == itemSuper {
+		// super yield {{yield super(...)}}
+		isSuper = true
 	} else if name.typ != itemIdentifier {
 		t.unexpected(name, context, "block name")
 	}
@@ -457,7 +497,13 @@ func (t *Template) parseYield() Node {
 		}
 	}
 
-	return t.newYield(name.pos, t.lex.lineNumber(), name.val, bplist, pipe, content, false)
+	yieldName := name.val
+	if isSuper {
+		yieldName = ""
+	}
+	yield := t.newYield(name.pos, t.lex.lineNumber(), yieldName, bplist, pipe, content, false)
+	yield.IsSuper = isSuper
+	return yield
 }
 
 func (t *Template) parseInclude() Node {
