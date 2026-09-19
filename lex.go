@@ -104,6 +104,7 @@ const (
 	itemNil
 	itemMSG
 	itemTrans
+	itemSuper
 )
 
 var key = map[string]itemType{
@@ -134,6 +135,8 @@ var key = map[string]itemType{
 
 	"msg":   itemMSG,
 	"trans": itemTrans,
+
+	"super": itemSuper,
 }
 
 const eof = -1

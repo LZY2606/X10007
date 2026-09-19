@@ -74,7 +74,13 @@ func (t *Template) String() (template string) {
 	return
 }
 
-func (t *Template) addBlocks(blocks map[string]*BlockNode) {
+// mergeBlocks merges blocks into t.processedBlocks. When a merged block
+// overrides a previously merged definition of the same name, the overriding
+// definition's Super link is pointed at the overridden one, forming the chain
+// that {{yield super()}} walks at runtime. Blocks coming from other templates
+// (extends/import) are shared, so they are shallow-copied before their Super
+// link is (re)set; the template's own blocks (own == true) are mutated in place.
+func (t *Template) mergeBlocks(blocks map[string]*BlockNode, own bool) {
 	if len(blocks) == 0 {
 		return
 	}
@@ -82,6 +88,14 @@ func (t *Template) addBlocks(blocks map[string]*BlockNode) {
 		t.processedBlocks = make(map[string]*BlockNode)
 	}
 	for key, value := range blocks {
+		if prev, ok := t.processedBlocks[key]; ok && prev != value {
+			if !own {
+				// don't mutate a block node owned by another template
+				cp := *value
+				value = &cp
+			}
+			value.Super = prev
+		}
 		t.processedBlocks[key] = value
 	}
 }
@@ -222,14 +236,25 @@ func (s *Set) parse(name, text string, cacheAfterParsing bool) (t *Template, err
 	t.stopParse()
 
 	if t.extends != nil {
-		t.addBlocks(t.extends.processedBlocks)
+		t.mergeBlocks(t.extends.processedBlocks, false)
 	}
 
 	for _, _import := range t.imports {
-		t.addBlocks(_import.processedBlocks)
+		t.mergeBlocks(_import.processedBlocks, false)
 	}
 
-	t.addBlocks(t.passedBlocks)
+	t.mergeBlocks(t.passedBlocks, true)
+
+	// record this template's direct parse-time dependencies so that
+	// Set.Reload can transitively invalidate dependent templates
+	deps := make([]string, 0, len(t.imports)+1)
+	if t.extends != nil {
+		deps = append(deps, t.extends.Name)
+	}
+	for _, _import := range t.imports {
+		deps = append(deps, _import.Name)
+	}
+	s.recordDeps(name, deps)
 
 	return t, err
 }
@@ -416,6 +441,7 @@ func (t *Template) parseYield() Node {
 		name    item
 		bplist  *BlockParameterList
 		content *ListNode
+		isSuper bool
 	)
 
 	// parse block name
@@ -426,7 +452,10 @@ func (t *Template) parseYield() Node {
 			pipe = t.expression(context, "content context")
 		}
 		t.expectRightDelim(context)
-		return t.newYield(name.pos, t.lex.lineNumber(), "", nil, pipe, nil, true)
+		return t.newYield(name.pos, t.lex.lineNumber(), "", nil, pipe, nil, true, false)
+	} else if name.typ == itemSuper {
+		// super yield {{yield super(...)}}
+		isSuper = true
 	} else if name.typ != itemIdentifier {
 		t.unexpected(name, context, "block name")
 	}
@@ -457,7 +486,7 @@ func (t *Template) parseYield() Node {
 		}
 	}
 
-	return t.newYield(name.pos, t.lex.lineNumber(), name.val, bplist, pipe, content, false)
+	return t.newYield(name.pos, t.lex.lineNumber(), name.val, bplist, pipe, content, false, isSuper)
 }
 
 func (t *Template) parseInclude() Node {

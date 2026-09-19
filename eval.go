@@ -76,6 +76,7 @@ type Runtime struct {
 	*scope
 	content      func(*Runtime, Expression)
 	includeDepth int
+	blockStack   []*BlockNode // stack of block definitions currently being executed (for super())
 
 	context reflect.Value
 }
@@ -233,6 +234,7 @@ func (st *Runtime) recover(err *error) {
 	// reset state scope and context just to be safe (they might not be cleared properly if there was a panic while using the state)
 	st.scope = &scope{}
 	st.context = reflect.Value{}
+	st.blockStack = nil
 	pool_State.Put(st)
 	if recovered := recover(); recovered != nil {
 		var ok bool
@@ -338,6 +340,9 @@ func (st *Runtime) executeLetList(set *SetNode) {
 
 func (st *Runtime) executeYieldBlock(block *BlockNode, blockParam, yieldParam *BlockParameterList, expression Expression, content *ListNode) {
 
+	st.blockStack = append(st.blockStack, block)
+	defer func() { st.blockStack = st.blockStack[:len(st.blockStack)-1] }()
+
 	needNewScope := len(blockParam.List) > 0 || len(yieldParam.List) > 0
 	if needNewScope {
 		st.newScope()
@@ -398,6 +403,119 @@ func (st *Runtime) executeYieldBlock(block *BlockNode, blockParam, yieldParam *B
 	st.content = mycontent
 	if needNewScope {
 		st.releaseScope()
+	}
+}
+
+// executeSuperYield executes the block definition overridden by the block
+// definition that is currently executing (i.e. {{ yield super() }}).
+// The overridden definition is resolved statically at parse time (see
+// Template.mergeBlocks) and is reachable from the currently executing
+// block's Super link.
+//
+// Arguments explicitly passed to super() are evaluated like regular yield
+// arguments. Arguments declared by the overridden definition but not passed
+// explicitly inherit the value bound to the same-named parameter of the
+// current invocation, if there is one; otherwise the overridden definition's
+// own default applies.
+func (st *Runtime) executeSuperYield(node *YieldNode) {
+	if len(st.blockStack) == 0 {
+		node.errorf("super() can only be used inside a block definition")
+	}
+	current := st.blockStack[len(st.blockStack)-1]
+	block := current.Super
+	if block == nil {
+		node.errorf("block %q does not override another block definition: super() has nothing to yield", current.Name)
+	}
+
+	blockParam := block.Parameters
+	yieldParam := node.Parameters
+
+	needNewScope := len(blockParam.List) > 0 || len(yieldParam.List) > 0
+	if needNewScope {
+		st.newScope()
+		// defer (instead of a plain call at the end of the function) so the
+		// scope is released even when a panic unwinds through this frame and
+		// is recovered by an enclosing {{try}}
+		defer st.releaseScope()
+	}
+
+	// bind explicitly passed arguments
+	explicit := make(map[string]bool, len(yieldParam.List))
+	for i := 0; i < len(yieldParam.List); i++ {
+		p := &yieldParam.List[i]
+		if p.Expression == nil {
+			node.errorf("missing expression for super() parameter '%s'", p.Identifier)
+		}
+		st.variables[p.Identifier] = st.evalPrimaryExpressionGroup(p.Expression)
+		explicit[p.Identifier] = true
+	}
+
+	// inherit same-named arguments bound by the current invocation
+	if current.Parameters != nil {
+		for i := 0; i < len(current.Parameters.List); i++ {
+			name := current.Parameters.List[i].Identifier
+			if explicit[name] {
+				continue
+			}
+			if _, found := st.variables[name]; found {
+				continue
+			}
+			if _, idx := blockParam.Param(name); idx < 0 {
+				continue // the overridden definition doesn't declare this parameter
+			}
+			if val, err := st.resolve(name); err == nil {
+				st.variables[name] = val
+			}
+		}
+	}
+
+	// fall back to the overridden definition's own defaults
+	for i := 0; i < len(blockParam.List); i++ {
+		p := &blockParam.List[i]
+		if _, found := st.variables[p.Identifier]; !found {
+			if p.Expression == nil {
+				st.variables[p.Identifier] = valueBoolFALSE
+			} else {
+				st.variables[p.Identifier] = st.evalPrimaryExpressionGroup(p.Expression)
+			}
+		}
+	}
+
+	mycontent := st.content
+	if content := node.Content; content != nil {
+		myscope := st.scope
+		st.content = func(st *Runtime, expression Expression) {
+			outscope := st.scope
+			outcontent := st.content
+
+			st.scope = myscope
+			st.content = mycontent
+
+			if expression != nil {
+				context := st.context
+				st.context = st.evalPrimaryExpressionGroup(expression)
+				st.executeList(content)
+				st.context = context
+			} else {
+				st.executeList(content)
+			}
+
+			st.scope = outscope
+			st.content = outcontent
+		}
+		defer func() { st.content = mycontent }()
+	}
+
+	st.blockStack = append(st.blockStack, block)
+	defer func() { st.blockStack = st.blockStack[:len(st.blockStack)-1] }()
+
+	if node.Expression != nil {
+		context := st.context
+		defer func() { st.context = context }()
+		st.context = st.evalPrimaryExpressionGroup(node.Expression)
+		st.executeList(block.List)
+	} else {
+		st.executeList(block.List)
 	}
 }
 
@@ -542,6 +660,8 @@ func (st *Runtime) executeList(list *ListNode) (returnValue reflect.Value) {
 				if st.content != nil {
 					st.content(st, node.Expression)
 				}
+			} else if node.IsSuper {
+				st.executeSuperYield(node)
 			} else {
 				block, found := st.getBlock(node.Name)
 				if !found || block == nil {

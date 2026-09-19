@@ -502,6 +502,11 @@ type BlockNode struct {
 
 	List    *ListNode
 	Content *ListNode
+
+	// Super is the previous definition of the same-named block that this
+	// definition overrides (via extends/import/self merge order in Set.parse).
+	// It is fixed at parse time and is nil when there is no overridden definition.
+	Super *BlockNode
 }
 
 func (t *BlockNode) String() string {
@@ -525,6 +530,7 @@ type YieldNode struct {
 	Expression Expression //The command to evaluate as dot for the template.
 	Content    *ListNode
 	IsContent  bool
+	IsSuper    bool // true for {{yield super(...)}}
 }
 
 func (t *YieldNode) String() string {
@@ -535,17 +541,22 @@ func (t *YieldNode) String() string {
 		return fmt.Sprintf("{{yield content %s}}", t.Expression)
 	}
 
+	name := t.Name
+	if t.IsSuper {
+		name = "super"
+	}
+
 	if t.Content != nil {
 		if t.Expression == nil {
-			return fmt.Sprintf("{{yield %s(%s) content}}%s{{end}}", t.Name, t.Parameters, t.Content)
+			return fmt.Sprintf("{{yield %s(%s) content}}%s{{end}}", name, t.Parameters, t.Content)
 		}
-		return fmt.Sprintf("{{yield %s(%s) %s content}}%s{{end}}", t.Name, t.Parameters, t.Expression, t.Content)
+		return fmt.Sprintf("{{yield %s(%s) %s content}}%s{{end}}", name, t.Parameters, t.Expression, t.Content)
 	}
 
 	if t.Expression == nil {
-		return fmt.Sprintf("{{yield %s(%s)}}", t.Name, t.Parameters)
+		return fmt.Sprintf("{{yield %s(%s)}}", name, t.Parameters)
 	}
-	return fmt.Sprintf("{{yield %s(%s) %s}}", t.Name, t.Parameters, t.Expression)
+	return fmt.Sprintf("{{yield %s(%s) %s}}", name, t.Parameters, t.Expression)
 }
 
 // IncludeNode represents a {{include }} action.

@@ -25,6 +25,13 @@ type Set struct {
 	rightDelim      string
 	leftComment       string
 	rightComment     string
+
+	// template invalidation bookkeeping for Set.Reload. The Cache interface
+	// has no way to delete entries, so staleness is tracked here, next to the
+	// cache: a cache hit on a stale template is treated as a miss.
+	rmx   sync.RWMutex
+	stale map[string]bool     // names (canonical paths) of templates whose cached parse result is stale
+	deps  map[string][]string // template name -> names of templates it directly extends/imports
 }
 
 // Option is the type of option functions that can be used in NewSet().
@@ -42,6 +49,8 @@ func NewSet(loader Loader, opts ...Option) *Set {
 		escapee: template.HTMLEscape,
 		globals: VarMap{},
 		gmx:     &sync.RWMutex{},
+		stale:   make(map[string]bool),
+		deps:    make(map[string][]string),
 		extensions: []string{
 			"", // in case the path is given with the correct extension already
 			".jet",
@@ -149,16 +158,93 @@ func (s *Set) getSiblingTemplate(templatePath, siblingPath string, cacheAfterPar
 func (s *Set) getTemplate(templatePath string, cacheAfterParsing bool) (t *Template, err error) {
 	if !s.developmentMode {
 		t, found := s.getTemplateFromCache(templatePath)
-		if found {
+		if found && !s.isStale(t.Name) {
 			return t, nil
 		}
 	}
 
 	t, err = s.getTemplateFromLoader(templatePath, cacheAfterParsing)
-	if err == nil && cacheAfterParsing && !s.developmentMode {
-		s.cache.Put(templatePath, t)
+	if err == nil {
+		s.clearStale(t.Name)
+		if cacheAfterParsing && !s.developmentMode {
+			s.cache.Put(templatePath, t)
+		}
 	}
 	return t, err
+}
+
+// Reload invalidates the cached parse result for templatePath, as well as the
+// cached parse results of all templates that transitively depend on it through
+// extends or import statements. The next time any of those templates is
+// requested via GetTemplate (or resolved via extends/import/include), its
+// contents are loaded from the Loader and parsed again. Templates that do not
+// transitively depend on templatePath are unaffected and keep being served
+// from the cache without hitting the Loader.
+//
+// Templates already executing keep running with the parse result they were
+// started with; Reload never mutates a parsed Template.
+func (s *Set) Reload(templatePath string) {
+	templatePath = filepath.ToSlash(templatePath)
+	if !path.IsAbs(templatePath) {
+		templatePath = path.Join("/", templatePath)
+	}
+
+	s.rmx.Lock()
+	defer s.rmx.Unlock()
+
+	// seed the invalidation set with every canonical path the requested
+	// template could have been parsed under (one per configured extension)
+	queue := make([]string, 0, len(s.extensions))
+	for _, extension := range s.extensions {
+		name := templatePath + extension
+		if _, known := s.deps[name]; known && !s.stale[name] {
+			s.stale[name] = true
+			queue = append(queue, name)
+		}
+	}
+
+	// transitively invalidate everything that (in)directly extends or
+	// imports a stale template
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		for tmpl, tmplDeps := range s.deps {
+			if s.stale[tmpl] {
+				continue
+			}
+			for _, dep := range tmplDeps {
+				if dep == name {
+					s.stale[tmpl] = true
+					queue = append(queue, tmpl)
+					break
+				}
+			}
+		}
+	}
+}
+
+// recordDeps remembers the direct extends/import dependencies of a parsed
+// template. It is called once per (re)parse by Set.parse.
+func (s *Set) recordDeps(name string, deps []string) {
+	s.rmx.Lock()
+	defer s.rmx.Unlock()
+	s.deps[name] = deps
+}
+
+// isStale reports whether the cached parse result for the template with the
+// given name has been invalidated via Reload.
+func (s *Set) isStale(name string) bool {
+	s.rmx.RLock()
+	defer s.rmx.RUnlock()
+	return s.stale[name]
+}
+
+// clearStale marks the template with the given name as fresh again after it
+// has been reloaded and re-parsed.
+func (s *Set) clearStale(name string) {
+	s.rmx.Lock()
+	defer s.rmx.Unlock()
+	delete(s.stale, name)
 }
 
 func (s *Set) getTemplateFromCache(templatePath string) (t *Template, ok bool) {

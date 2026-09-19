@@ -1,0 +1,5 @@
+{{ extends "base.jet" }}
+{{ block main() }}{{ yield super() }}{{ end }}
+===
+{{extends "base.jet"}}
+{{block main()}}{{yield super()}}{{end}}
